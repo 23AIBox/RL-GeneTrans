@@ -1,6 +1,7 @@
 # RL-GeneTrans
 ## Overview of the framework
-RL-GeneTrans is a deep reinforcement learning-based method for identifying risk genes associated with NASH-HCC transition. To introduce transition-related information, RL-GeneTrans optimized the PPI network structure. The task of optimizing the PPI network structure is formulated as a Markov Decision Process (MDP). In this RL-GeneTrans, the state is characterized by the weighted adjacency matrix of the PPI network, and action is defined as a modification to this matrix. A data-label dual-driven reward is designed to introduce NASH-HCC transition-related information, which utilizes the expression data of NASH-HCC patients and known risk genes. 
+Reinforcement Learning-based and Data-driven biological network optimization and propagation-based candidate gene prioritization for **NASH**, **NASH-HCC**, and the **NASH-to-HCC transition**. Specifically, we formulate the optimization of biological network structures as a reinforcement learning problem and design a data-driven reward function to guide the optimization process. The data-driven reward incorporates differential gene expression information between NASH-HCC tissues and adjacent non-tumor NASH tissues, thereby capturing molecular changes associated with the transition from NASH to NASH-HCC. A graph transformer–based agent is designed to integrate global and local information from the biological network and iteratively optimize its structure under the guidance of the data-driven reward.
+
 
 ## Installation & Dependencies
 
@@ -39,10 +40,5 @@ We also provided a conda environment file (from Linux). Users can build the envi
 ```
 conda env create -f environment.yaml
 ```
-
-We upload a trained model for NASH-HCC transition risk gene identification. To run this model, you can use the command line instructions:
-```
-python run.py
-```
-After the process is completed, the file `Gene_Ranking.csv` is output in the corresponding directory, which contains the identified gene risk ranking list.
+The source code of RL-GeneTrans is in ./src. Input data and optimized networks for **NASH**, **NASH-HCC**, and the **NASH-to-HCC transition** are in ./data. 
 
