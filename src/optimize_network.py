@@ -67,32 +67,6 @@ def index_ppi(raw):
     return genes, edge_index, unique_edges
 
 
-def make_folds(genes, positives, negatives, seed):
-    mapping = {g: i for i, g in enumerate(genes)}
-    positive_set, negative_set = set(positives), set(negatives)
-    if positive_set & negative_set:
-        raise ValueError('Positive and negative labels overlap')
-    missing = (positive_set | negative_set) - set(genes)
-    if missing:
-        raise ValueError(f'Labels missing from PPI: {sorted(missing)[:10]}')
-    ordered = sorted(positives) + sorted(negatives)
-    folds = [[mapping[g] for g in ordered[i::5]] for i in range(5)]
-    rng = np.random.RandomState(seed)  # notebook: np.random.seed followed by five shuffles
-    for fold in folds:
-        rng.shuffle(fold)
-    y = np.array([1 if g in positive_set else 0 if g in negative_set else 2
-                  for g in genes], dtype=np.int64)
-    return folds, y
-
-
-def split_fold(folds, fold):
-    if fold == 5:
-        ids = np.asarray(sum(folds, []), dtype=np.int64)
-        return ids, ids.copy()
-    train = np.asarray(sum([f for i, f in enumerate(folds) if i != fold], []), dtype=np.int64)
-    return train, np.asarray(folds[fold], dtype=np.int64)
-
-
 def gene_logfc(path, genes):
     frame = pd.read_csv(path, sep='\t', usecols=['Gene.Symbol', 'logFC'])
     frame = frame.loc[frame['Gene.Symbol'].notna()].copy()
@@ -126,15 +100,6 @@ def select_data_seeds(path, genes, kk):
         raise ValueError(f'--data-seed-top-k={kk} exceeds {len(valid)} valid PPI genes')
     order = valid[np.argsort(np.abs(logfc[valid]), kind='stable')]
     return order[-kk:]
-
-
-def rewards(z, positives, negatives, de, nonde):
-    if not torch.isfinite(z).all():
-        raise ValueError('Nonfinite Z-score in a reward group')
-    label = z[positives].mean() - z[negatives].mean()
-    z64 = z.to(torch.float64)
-    data = z64[de].mean() - z64[nonde].mean()
-    return label, data
 
 
 def degree_bins(degrees, bin_size):
@@ -239,9 +204,6 @@ def score_stats(z, details, high, low):
 
 DATA_STAT_FIELDS = ['high_mean_z', 'low_mean_z', 'high_mean_heat', 'low_mean_heat',
                     'null_std_min', 'null_std_p01', 'null_std_median', 'null_std_below_epsilon']
-LABEL_STAT_FIELDS = ['label_positive_mean_z', 'label_negative_mean_z',
-                     'label_null_std_min', 'label_null_std_p01', 'label_null_std_median',
-                     'label_null_std_below_epsilon', 'label_random_seed_mass_mean']
 DATA_REWARD_STAT_FIELDS = ['data_reward_raw', 'data_reward_asinh',
                            'high_mean_z_asinh', 'low_mean_z_asinh']
 
@@ -262,62 +224,38 @@ def data_reward_from_z(z, high, low, transform='none', z_scale=3.):
     return (raw if transform == 'none' else transformed), stats
 
 
-def score_reward_branches(adj, positives, negatives, high, low, args, rngs=None, indices=None,
-                          data_seeds=None):
-    rngs = rngs or {}
+def score_data_reward(adj, high, low, args, rng=None, indices=None, data_seeds=None):
     if data_seeds is None:
         if args.use_data_reward and getattr(args, 'data_seed_top_k', None) not in (None, len(high)):
             raise ValueError('Explicit data_seeds required when data_seed_top_k differs from reward K')
         data_seeds = high
-    provided = indices or {}
-    sampled = {}
-    stats = {key: None for key in DATA_STAT_FIELDS + LABEL_STAT_FIELDS + DATA_REWARD_STAT_FIELDS +
+    stats = {key: None for key in DATA_STAT_FIELDS + DATA_REWARD_STAT_FIELDS +
              ['random_seed_mass_mean', 'data_random_seed_mass_mean']}
-    label = adj.new_zeros(())
     data = adj.new_zeros((), dtype=torch.float64)
-    for branch, enabled, seeds in [('label', args.use_label_reward, positives),
-                                    ('data', args.use_data_reward, data_seeds)]:
-        if not enabled:
-            continue
-        if not len(seeds):
-            raise ValueError(f'Empty {branch} seed group')
-        if (branch == 'label' and not len(negatives)) or (branch == 'data' and not len(low)):
-            raise ValueError(f'Empty {branch} comparison group')
-        sampled[branch] = provided[branch] if branch in provided else sample_background(
-            adj, seeds, args, rngs.get(branch, None))
-        z, details = diffuse(adj, seeds, args, indices=sampled[branch])
-        if not torch.isfinite(z).all():
-            raise ValueError(f'Nonfinite Z-score in {branch} diffusion')
-        if branch == 'label':
-            label = z[positives].mean() - z[negatives].mean()
-            with torch.no_grad():
-                std = details['null_std']
-                quantiles = torch.quantile(std, std.new_tensor([.01, .5]))
-                stats.update(label_positive_mean_z=float(z[positives].mean()),
-                    label_negative_mean_z=float(z[negatives].mean()),
-                    label_null_std_min=float(std.min()), label_null_std_p01=float(quantiles[0]),
-                    label_null_std_median=float(quantiles[1]),
-                    label_null_std_below_epsilon=int((std < 1e-6).sum()),
-                    label_random_seed_mass_mean=details['random_seed_mass_mean'])
-        else:
-            data, reward_stats = data_reward_from_z(z, high, low,
-                args.data_reward_transform, args.data_reward_z_scale)
-            stats.update(reward_stats)
-            stats.update(score_stats(z, details, high, low))
-            stats['random_seed_mass_mean'] = details['random_seed_mass_mean']
-            stats['data_random_seed_mass_mean'] = details['random_seed_mass_mean']
-    return label, data, stats, sampled
+    if not args.use_data_reward:
+        return data, stats, None
+    if not len(data_seeds) or not len(high) or not len(low):
+        raise ValueError('Empty data seed or comparison group')
+    sampled = indices if indices is not None else sample_background(adj, data_seeds, args, rng)
+    z, details = diffuse(adj, data_seeds, args, indices=sampled)
+    if not torch.isfinite(z).all():
+        raise ValueError('Nonfinite Z-score in data diffusion')
+    data, reward_stats = data_reward_from_z(z, high, low,
+        args.data_reward_transform, args.data_reward_z_scale)
+    stats.update(reward_stats)
+    stats.update(score_stats(z, details, high, low))
+    stats['random_seed_mass_mean'] = details['random_seed_mass_mean']
+    stats['data_random_seed_mass_mean'] = details['random_seed_mass_mean']
+    return data, stats, sampled
 
 
-def weighted_reward(label, data, args):
-    return ((args.label_weight * label if args.use_label_reward else label.new_zeros(())) +
-            (args.data_weight * data if args.use_data_reward else data.new_zeros(())))
+def weighted_reward(data, args):
+    return args.data_weight * data if args.use_data_reward else data.new_zeros(())
 
 
-def gradient_diagnostics(actor, label, data, structural, args):
+def gradient_diagnostics(actor, data, structural, args):
     params = list(actor.parameters())
-    terms = {'label': args.reward_coefficient * args.label_weight * label,
-             'data': args.reward_coefficient * args.data_weight * data,
+    terms = {'data': args.reward_coefficient * args.data_weight * data,
              'structure': args.structure_weight * structural}
     grads, report = {}, {}
     for name, term in terms.items():
@@ -331,7 +269,7 @@ def gradient_diagnostics(actor, label, data, structural, args):
             raise RuntimeError(f'Nonfinite {name} component gradient')
         report[name + '_gradient_norm'] = float(norm)
         grads[name] = values
-    for a, b in [('data', 'label'), ('data', 'structure')]:
+    for a, b in [('data', 'structure')]:
         denominator = report[a + '_gradient_norm'] * report[b + '_gradient_norm']
         if denominator:
             dot = sum((ga * gb).sum(dtype=torch.float64) for ga, gb in zip(grads[a], grads[b])
@@ -502,13 +440,13 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--task', choices=TASKS, default='NASH-to-HCC', help='Canonical task names (not legacy disease aliases)')
     p.add_argument('--project-root', type=Path, default=PROJECT)
-    p.add_argument('--data-root', type=Path, help='Default: <project>/data/tasks')
     p.add_argument('--ppi', type=Path)
     p.add_argument('--features', type=Path)
     p.add_argument('--de-file', type=Path)
     p.add_argument('--output', type=Path, help='New run directory; default timestamped directory')
     p.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
-    p.add_argument('--folds', type=int, nargs='+', default=[5], help='0..4 CV training graphs; 5 full-data fit')
+    p.add_argument('--folds', type=int, nargs='+', choices=[5], default=[5],
+                   help='Legacy full-data run identifier; kept as 5 for output/RNG compatibility')
     p.add_argument('--epochs', type=int, default=2001)
     p.add_argument('--lr', type=float, default=1e-7)
     p.add_argument('--lr-scheduler', choices=['constant', 'cosine'], default='constant',
@@ -518,10 +456,7 @@ def parser():
     p.add_argument('--hidden', type=int, default=512)
     p.add_argument('--heads', type=int, default=4)
     p.add_argument('--dropout', type=float, default=.1)
-    p.add_argument('--label-weight', type=float, default=1.)
     p.add_argument('--data-weight', type=float, default=100.)
-    p.add_argument('--use-label-reward', action=argparse.BooleanOptionalAction, default=True,
-                   help='Training-positive seeds for label reward; disabling skips this diffusion')
     p.add_argument('--use-data-reward', action=argparse.BooleanOptionalAction, default=True,
                    help='Top-KK high-|logFC| seeds for separate data diffusion; disabling skips it')
     p.add_argument('--reward-coefficient', type=float, default=-1., help='Notebook lambda_3')
@@ -576,13 +511,9 @@ def parser():
 
 def load_inputs(args):
     root = args.project_root.resolve()
-    data_root = args.data_root or root / 'data/tasks'
-    source = data_root / args.task / 'sources'
     paths = {
-        'positive_labels': source / 'positives.csv',
-        'negative_labels': source / 'legacy_negative_pool.csv',
-        'ppi': args.ppi or root / 'data/Network/STRING_PPI/STRING_Keep_Genes_in_GEO_based_700.npy.gz',
-        'features': args.features or root / 'data/Feature/STRING_Feature_mtx_wo_TCGA.npy',
+        'ppi': args.ppi or root / 'data/Network/STRING_PPI/STRING.npy.gz',
+        'features': args.features or root / 'data/Feature/STRING_Feature_mtx.npy',
         'de': args.de_file or root / 'data/GEO' / DE_FILES[args.task],
     }
     if str(paths['ppi']).endswith('.gz'):
@@ -595,13 +526,9 @@ def load_inputs(args):
     x = np.load(paths['features'], allow_pickle=False).astype(np.float32)
     if x.ndim != 2 or x.shape[0] != len(genes) or not np.isfinite(x).all():
         raise ValueError('Invalid feature shape/alignment/nonfinite features')
-    def gene_list(path):
-        s = pd.read_csv(path).Genes.dropna().astype(str).str.strip()
-        return s[s.ne('')].drop_duplicates().tolist()
-    folds, y = make_folds(genes, gene_list(paths['positive_labels']), gene_list(paths['negative_labels']), args.seed)
     de, nonde = de_groups(paths['de'], genes, args.data_top_k)
     provenance = {name: {'path': str(path.resolve()), 'sha256': sha256(path)} for name, path in paths.items()}
-    return genes, x, edges, original_edges, folds, y, de, nonde, provenance
+    return genes, x, edges, original_edges, de, nonde, provenance
 
 
 def run(args):
@@ -622,15 +549,14 @@ def run(args):
         args.background_backend = 'reference'
         args.topk_backend = 'reference'
         args.structure_backend = 'reference'
-    genes, x_np, edges_np, original_np, folds, y, de, nonde, provenance = load_inputs(args)
+    genes, x_np, edges_np, original_np, de, nonde, provenance = load_inputs(args)
     data_seeds = select_data_seeds(Path(provenance['de']['path']), genes, args.data_seed_top_k)
     n = len(genes)
     if args.top_k > n:
         raise ValueError('--top-k exceeds number of genes')
-    reward_mode = ('label_data' if args.use_label_reward and args.use_data_reward else
-                   'label_only' if args.use_label_reward else 'data_only' if args.use_data_reward else 'structure_only')
+    reward_mode = 'data_only' if args.use_data_reward else 'structure_only'
     if args.train_actor and reward_mode == 'structure_only' and args.structure_weight == 0:
-        raise ValueError('Both rewards are disabled and structure weight is zero: no training objective')
+        raise ValueError('Data reward is disabled and structure weight is zero: no training objective')
     transform_tag = 'raw' if args.data_reward_transform == 'none' else f'asinh_z_s_{args.data_reward_z_scale:g}'
     out = args.output or PROJECT / 'outputs/optimization' / args.task / f'K_{args.data_top_k}' / f'KK_{args.data_seed_top_k}' / reward_mode / transform_tag / f'{args.topk_symmetrization}_{args.structure_mode}' / ('train' if args.train_actor else 'frozen') / datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     out.mkdir(parents=True, exist_ok=False)
@@ -638,7 +564,7 @@ def run(args):
     edges = torch.tensor(edges_np, dtype=torch.long, device=device)
     original = torch.tensor(original_np, dtype=torch.long, device=device)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    config.update(method='differentiable_projected_dual_seed_diffusion', data_reward='mean_z_high_abs_logFC_minus_mean_z_low_abs_logFC',
+    config.update(method='differentiable_projected_data_diffusion', data_reward='mean_z_high_abs_logFC_minus_mean_z_low_abs_logFC',
                   effective_min_lr=(args.lr * .01 if args.min_lr is None else args.min_lr) if args.lr_scheduler == 'cosine' else None,
                   lr_schedule_definition='constant or cosine over epochs 0..epochs-1, independent of scale-epochs; one epoch uses initial LR',
                   lr_logging='learning_rate is the optimizer LR used at that epoch, before scheduler advancement; frozen Actor keeps initial LR and performs no optimizer/scheduler steps',
@@ -651,7 +577,7 @@ def run(args):
                   data_reward_definition=('mean(Z_high)-mean(Z_low)' if args.data_reward_transform == 'none' else
                                           'mean(s*asinh(Z_high/s))-mean(s*asinh(Z_low/s))'),
                   data_reward_log_semantics='data_reward is the selected optimization reward; raw/asinh versions logged separately; high_mean_z/low_mean_z stay raw',
-                  reward_mode=reward_mode, label_seed_definition='current fold training positives',
+                  reward_mode=reward_mode,
                   data_seed_definition='highest data_seed_top_k absolute logFC genes; independent of reward groups',
                   data_seed_genes=len(data_seeds),
                   data_seed_overlap_high=int(np.isin(data_seeds, de).sum()),
@@ -660,7 +586,7 @@ def run(args):
                   memory_optimization='normalization inside diffusion checkpoint; fresh-sum in-place scaling; optional stride-preserving CPU activation storage',
                   activation_offload='preserve original strides; collapse broadcast dimensions; overlapping-view passthrough',
                   disabled_reward_logging='null/blank; branch diffusion skipped; weighted contribution zero',
-                  unprefixed_diffusion_stats='data branch; label branch uses label_ prefix',
+                  unprefixed_diffusion_stats='data diffusion',
                   gradient_scope='observed and null diffusion; conditional on sampled indices; one graph update',
                   zero_std_subgradient='zero via centered vector norm; denominator remains std + 1e-6',
                   control_semantics='no-train-actor skips backward/optimizer; train-mode buffers/dropout retained',
@@ -674,7 +600,7 @@ def run(args):
                   python=platform.python_version(), torch=str(torch.__version__),
                   numpy=np.__version__, script_sha256=sha256(__file__), inputs=provenance)
     (out / 'config.json').write_text(json.dumps(config, indent=2, ensure_ascii=False))
-    pd.DataFrame({'node_index': np.arange(n), 'gene': genes, 'label': y}).to_csv(out / 'gene_index.csv', index=False)
+    pd.DataFrame({'node_index': np.arange(n), 'gene': genes}).to_csv(out / 'gene_index.csv', index=False)
     groups = pd.DataFrame({'node_index': np.arange(n), 'gene': genes, 'group': 'not_selected'})
     groups['logFC'] = gene_logfc(Path(provenance['de']['path']), genes)
     groups['abs_logFC'] = groups['logFC'].abs()
@@ -683,35 +609,27 @@ def run(args):
     groups.loc[nonde, 'group'] = 'low_abs_logFC'
     groups['is_data_seed'] = np.isin(np.arange(n), data_seeds)
     groups.to_csv(out / 'data_reward_groups.csv', index=False)
-    rngs = {name: np.random.default_rng(None if args.background_seed is None else args.background_seed+offset)
-            for name, offset in [('label', 0), ('data', DATA_BACKGROUND_OFFSET)]}
+    data_rng = np.random.default_rng(None if args.background_seed is None else
+                                     args.background_seed + DATA_BACKGROUND_OFFSET)
     def tick():
         if args.profile and device.type == 'cuda':
             torch.cuda.synchronize(device)
         return time.perf_counter()
     summaries = []
     with tee_log(out / 'console.log'):
-        print(f'Task={args.task}; method=differentiable_projected_dual_seed_diffusion; topk_symmetrization={args.topk_symmetrization}; structure_mode={args.structure_mode}; rewards={reward_mode}; data_reward_transform={args.data_reward_transform}; z_scale={args.data_reward_z_scale:g}; reward_stage=after_topk; device={device}; data_top_k={args.data_top_k}; data_seed_top_k={args.data_seed_top_k}; high_abs_logFC={len(de)}; low_abs_logFC={len(nonde)}', flush=True)
+        print(f'Task={args.task}; method=differentiable_projected_data_diffusion; topk_symmetrization={args.topk_symmetrization}; structure_mode={args.structure_mode}; rewards={reward_mode}; data_reward_transform={args.data_reward_transform}; z_scale={args.data_reward_z_scale:g}; reward_stage=after_topk; device={device}; data_top_k={args.data_top_k}; data_seed_top_k={args.data_seed_top_k}; high_abs_logFC={len(de)}; low_abs_logFC={len(nonde)}', flush=True)
         print(f'Output: {out.resolve()}', flush=True)
         print(f'Learning rate: scheduler={args.lr_scheduler}; initial={args.lr:g}; '
               f'minimum={config["effective_min_lr"]}; epochs={args.epochs}; train_actor={args.train_actor}', flush=True)
         for fold in args.folds:
             folder = out / f'fold_{fold}'
             folder.mkdir()
-            train, test = split_fold(folds, fold)
-            positives, negatives = train[y[train] == 1], train[y[train] == 0]
-            if args.use_label_reward and (not len(positives) or not len(negatives)):
-                raise ValueError('Empty training label group')
-            (folder / 'split.json').write_text(json.dumps({'train_nodes': train.tolist(), 'test_nodes': test.tolist(),
-                'seed_nodes': positives.tolist(), 'training_negative_nodes': negatives.tolist(),
-                'label_seed_nodes': positives.tolist(), 'data_seed_nodes': data_seeds.tolist(),
+            (folder / 'data_selection.json').write_text(json.dumps({'data_seed_nodes': data_seeds.tolist(),
                 'data_high_nodes': de.tolist(), 'data_low_nodes': nonde.tolist(),
-                'use_label_reward': args.use_label_reward, 'use_data_reward': args.use_data_reward,
-                'full_fit': fold == 5}, indent=2))
+                'use_data_reward': args.use_data_reward, 'full_fit': True}, indent=2))
             pd.DataFrame({'node_index': data_seeds, 'gene': genes[data_seeds]}).to_csv(folder / 'data_seed_genes.csv', index=False)
-            pd.DataFrame({'node_index': positives, 'gene': genes[positives]}).to_csv(folder / 'label_seed_genes.csv', index=False)
             (folder / 'background_rng_start.json').write_text(json.dumps(
-                {name: rng.bit_generator.state for name, rng in rngs.items()}, indent=2))
+                {'data': data_rng.bit_generator.state}, indent=2))
             actor = GPS_MLP_Actor(x.shape[1], args.hidden, n, args.heads, args.dropout).to(device)
             optimizer = torch.optim.Adam(actor.parameters(), lr=args.lr)
             scheduler = make_lr_scheduler(optimizer, args) if args.train_actor else None
@@ -727,25 +645,23 @@ def run(args):
                                          ref_values.detach().cpu().numpy())))
                 print(f'[Fold {fold}] Fixed structure reference: {ref_values.numel()} directed edges; initial projected PPI', flush=True)
             current_edges = edges
-            diagnostic_fields = ['label_gradient_norm', 'data_gradient_norm', 'structure_gradient_norm',
-                                 'data_label_gradient_cosine', 'data_structure_gradient_cosine',
-                                 'post_topk_label_same_background', 'post_topk_data_same_background',
+            diagnostic_fields = ['data_gradient_norm', 'structure_gradient_norm',
+                                 'data_structure_gradient_cosine', 'post_topk_data_same_background',
                                  'post_topk_reward_same_background', 'scored_graph_data_recheck_error',
-                                 'scored_graph_label_recheck_error',
                                  'directed_edges_added', 'directed_edges_removed',
-                                 'post_topk_label_independent_background', 'post_topk_data_independent_background']
+                                 'post_topk_data_independent_background']
             diagnostic_fields += ['post_topk_data_raw_same_background', 'post_topk_data_asinh_same_background',
                                   'post_topk_data_raw_independent_background', 'post_topk_data_asinh_independent_background']
-            fields = ['task', 'fold', 'epoch', 'total_reward', 'label_reward', 'data_reward',
+            fields = ['task', 'fold', 'epoch', 'total_reward', 'data_reward',
                       'structure_loss', 'l1_reg', 'total_loss', 'directed_edges_after_topk',
                       'scale', 'diffusion_backend', 'random_seed_mass_mean', 'gradient_norm',
                       'train_actor', 'high_mean_z', 'low_mean_z', 'high_mean_heat', 'low_mean_heat',
                       'null_std_min', 'null_std_p01', 'null_std_median', 'null_std_below_epsilon',
                       'actor_seconds', 'diffusion_seconds', 'backward_seconds', 'topk_seconds',
-                      'diagnostic_seconds', 'epoch_seconds', 'use_label_reward', 'use_data_reward',
-                      'label_weighted_reward', 'data_weighted_reward', 'data_random_seed_mass_mean',
-                      'label_seed_count', 'data_seed_count', 'data_top_k', 'data_seed_top_k',
-                      'data_reward_transform', 'data_reward_z_scale'] + LABEL_STAT_FIELDS + DATA_REWARD_STAT_FIELDS + diagnostic_fields
+                      'diagnostic_seconds', 'epoch_seconds', 'use_data_reward',
+                      'data_weighted_reward', 'data_random_seed_mass_mean',
+                      'data_seed_count', 'data_top_k', 'data_seed_top_k',
+                      'data_reward_transform', 'data_reward_z_scale'] + DATA_REWARD_STAT_FIELDS + diagnostic_fields
             fields += ['cuda_peak_allocated_mib', 'cuda_peak_reserved_mib',
                        'topk_symmetrization', 'structure_mode', 'structure_reference_edge_count',
                        'structure_weighted_loss']
@@ -754,10 +670,9 @@ def run(args):
             evaluation_seed = args.seed + 1000003 + fold
             (folder / 'diagnostic_sampling.json').write_text(json.dumps(dict(
                 common_seed=common_seed, independent_evaluation_seed=evaluation_seed,
-                label_common_seed=common_seed, data_common_seed=common_seed+DATA_BACKGROUND_OFFSET,
-                label_independent_evaluation_seed=evaluation_seed,
+                data_common_seed=common_seed+DATA_BACKGROUND_OFFSET,
                 data_independent_evaluation_seed=evaluation_seed+DATA_BACKGROUND_OFFSET,
-                note='Separate RNG streams and matched seed sets per branch; evaluation does not advance training RNG. Current-graph degree bins are recomputed.'), indent=2))
+                note='Matched data seed sets; evaluation does not advance training RNG. Current-graph degree bins are recomputed.'), indent=2))
             with (folder / 'reward_history.csv').open('w', newline='') as f:
                 import csv
                 writer = csv.DictWriter(f, fieldnames=fields)
@@ -779,13 +694,12 @@ def run(args):
                                            args.topk_symmetrization)
                         after_projection = tick()
                         if args.background_mode == 'common':
-                            step_rngs = {'label': np.random.default_rng(common_seed),
-                                         'data': np.random.default_rng(common_seed+DATA_BACKGROUND_OFFSET)}
+                            step_rng = np.random.default_rng(common_seed+DATA_BACKGROUND_OFFSET)
                         else:
-                            step_rngs = rngs
-                        label_tensor, data_tensor, stats, indices = score_reward_branches(
-                            adj, positives, negatives, de, nonde, args, rngs=step_rngs, data_seeds=data_seeds)
-                        reward_tensor = weighted_reward(label_tensor, data_tensor, args)
+                            step_rng = data_rng
+                        data_tensor, stats, indices = score_data_reward(
+                            adj, de, nonde, args, rng=step_rng, data_seeds=data_seeds)
+                        reward_tensor = weighted_reward(data_tensor, args)
                         after_diffusion = tick()
                         structural = structure_loss(adj, original, args.structure_backend, mask,
                                                     args.structure_mode, structure_reference)
@@ -795,17 +709,14 @@ def run(args):
                             raise RuntimeError(f'Nonfinite loss at fold {fold}, epoch {epoch}')
                         loss_value, structural_value = float(loss.detach()), float(structural.detach())
                         reward = float(reward_tensor.detach())
-                        label_reward = float(label_tensor.detach()) if args.use_label_reward else None
                         data_reward = float(data_tensor.detach()) if args.use_data_reward else None
                         optimizer.zero_grad(set_to_none=True)
                         grad_norm = 0.
                         if args.train_actor:
                             if args.use_data_reward and not data_tensor.requires_grad:
                                 raise RuntimeError('Data reward is disconnected from autograd')
-                            if args.use_label_reward and not label_tensor.requires_grad:
-                                raise RuntimeError('Label reward is disconnected from autograd')
                             if diagnose:
-                                diagnostic.update(gradient_diagnostics(actor, label_tensor, data_tensor, structural, args))
+                                diagnostic.update(gradient_diagnostics(actor, data_tensor, structural, args))
                             loss.backward()
                             grad_norm = float(torch.nn.utils.clip_grad_norm_(
                                 actor.parameters(), args.max_grad_norm if args.max_grad_norm > 0 else float('inf'),
@@ -815,7 +726,7 @@ def run(args):
                                 scheduler.step()
                         after_backward = tick()
                     # Carry exactly the scored projected graph; NEVER apply Top-K a second time.
-                    del label_tensor, data_tensor, reward_tensor, loss, structural
+                    del data_tensor, reward_tensor, loss, structural
                     adj = adj.detach()
                     previous_edges = current_edges
                     current_edges = torch.nonzero(adj > 0, as_tuple=False).T.contiguous()
@@ -823,41 +734,34 @@ def run(args):
                     if diagnose:
                         with torch.no_grad():
                             # Recheck the exact scored graph with the same indices; difference should be ~0.
-                            lp, rp, replay_stats, _ = score_reward_branches(adj, positives, negatives, de, nonde, args,
+                            rp, replay_stats, _ = score_data_reward(adj, de, nonde, args,
                                 indices=indices, data_seeds=data_seeds)
-                            diagnostic.update(post_topk_label_same_background=float(lp) if args.use_label_reward else None,
-                                post_topk_data_same_background=float(rp) if args.use_data_reward else None,
-                                post_topk_reward_same_background=float(weighted_reward(lp, rp, args)),
-                                scored_graph_data_recheck_error=float(rp)-data_reward if args.use_data_reward else None,
-                                scored_graph_label_recheck_error=float(lp)-label_reward if args.use_label_reward else None)
+                            diagnostic.update(post_topk_data_same_background=float(rp) if args.use_data_reward else None,
+                                post_topk_reward_same_background=float(weighted_reward(rp, args)),
+                                scored_graph_data_recheck_error=float(rp)-data_reward if args.use_data_reward else None)
                             diagnostic.update(post_topk_data_raw_same_background=replay_stats['data_reward_raw'],
                                               post_topk_data_asinh_same_background=replay_stats['data_reward_asinh'])
                             diagnostic.update(support_changes(previous_edges, current_edges, n))
-                            if ((args.use_data_reward and not np.isclose(float(rp), data_reward, rtol=1e-4, atol=1e-5)) or
-                                (args.use_label_reward and not np.isclose(float(lp), label_reward, rtol=1e-4, atol=1e-5))):
+                            if args.use_data_reward and not np.isclose(float(rp), data_reward, rtol=1e-4, atol=1e-5):
                                 raise RuntimeError('Scored and carried graph rewards differ on the same background')
-                            le, re, evaluation_stats, _ = score_reward_branches(adj, positives, negatives, de, nonde, args,
-                                rngs={'label': np.random.default_rng(evaluation_seed),
-                                      'data': np.random.default_rng(evaluation_seed+DATA_BACKGROUND_OFFSET)},
+                            re, evaluation_stats, _ = score_data_reward(adj, de, nonde, args,
+                                rng=np.random.default_rng(evaluation_seed+DATA_BACKGROUND_OFFSET),
                                 data_seeds=data_seeds)
-                            diagnostic.update(post_topk_label_independent_background=float(le) if args.use_label_reward else None,
-                                              post_topk_data_independent_background=float(re) if args.use_data_reward else None)
+                            diagnostic.update(post_topk_data_independent_background=float(re) if args.use_data_reward else None)
                             diagnostic.update(post_topk_data_raw_independent_background=evaluation_stats['data_reward_raw'],
                                               post_topk_data_asinh_independent_background=evaluation_stats['data_reward_asinh'])
-                            del lp, rp, le, re
+                            del rp, re
                     end = tick()
                     peak_allocated = (torch.cuda.max_memory_allocated(device) / 2**20
                                       if args.profile_memory and device.type == 'cuda' else None)
                     peak_reserved = (torch.cuda.max_memory_reserved(device) / 2**20
                                      if args.profile_memory and device.type == 'cuda' else None)
                     row = dict(task=args.task, fold=fold, epoch=epoch, total_reward=reward,
-                        label_reward=label_reward, data_reward=data_reward, structure_loss=structural_value,
+                        data_reward=data_reward, structure_loss=structural_value,
                         l1_reg=l1, total_loss=loss_value, directed_edges_after_topk=current_edges.shape[1],
                         scale=scale, diffusion_backend='dense',
-                        use_label_reward=args.use_label_reward, use_data_reward=args.use_data_reward,
-                        label_weighted_reward=args.label_weight*label_reward if args.use_label_reward else 0.,
+                        use_data_reward=args.use_data_reward,
                         data_weighted_reward=args.data_weight*data_reward if args.use_data_reward else 0.,
-                        label_seed_count=len(positives) if args.use_label_reward else 0,
                         data_seed_count=len(data_seeds) if args.use_data_reward else 0,
                         data_top_k=args.data_top_k, data_seed_top_k=args.data_seed_top_k,
                         data_reward_transform=args.data_reward_transform, data_reward_z_scale=args.data_reward_z_scale,
@@ -873,10 +777,9 @@ def run(args):
                     writer.writerow(row)
                     f.flush()
                     if epoch % args.log_every == 0 or epoch == args.epochs-1:
-                        label_text = f'{label_reward:.6f}' if args.use_label_reward else 'disabled'
                         data_text = f'{data_reward:.6f}' if args.use_data_reward else 'disabled'
                         raw_text = f'{stats["data_reward_raw"]:.6f}' if args.use_data_reward else 'disabled'
-                        print(f'[Fold {fold}] Epoch {epoch:04d} Reward(post-TopK)={reward:.6f} Label={label_text} '
+                        print(f'[Fold {fold}] Epoch {epoch:04d} Reward(post-TopK)={reward:.6f} '
                               f'Data={data_text} DataRaw={raw_text} Structure={structural_value:.6f} Loss={loss_value:.6f} '
                               f'Grad={grad_norm:.6g} LR={learning_rate:.6g} Edges={current_edges.shape[1]} Seconds={end-start:.3f}', flush=True)
                         if peak_allocated is not None:
@@ -890,7 +793,7 @@ def run(args):
                         'lr_scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                         'last_epoch': epoch, 'network_file': network_file.name}, folder / 'actor.pt')
             summary = dict(fold=fold, epochs_completed=args.epochs, final_reward_after_topk=reward,
-                           final_label_reward=label_reward, final_data_reward=data_reward,
+                           final_data_reward=data_reward,
                            final_data_reward_raw=stats['data_reward_raw'], final_data_reward_asinh=stats['data_reward_asinh'],
                            data_reward_transform=args.data_reward_transform, data_reward_z_scale=args.data_reward_z_scale,
                            topk_symmetrization=args.topk_symmetrization, structure_mode=args.structure_mode,
@@ -918,7 +821,7 @@ def main():
         or args.data_top_k < 1 or args.diagnostic_every < 0 or args.max_grad_norm < 0
         or (args.data_seed_top_k is not None and args.data_seed_top_k < 1)
         or not np.isfinite(args.data_reward_z_scale) or args.data_reward_z_scale <= 0
-        or any(f not in range(6) for f in args.folds) or len(set(args.folds)) != len(args.folds)
+        or any(f != 5 for f in args.folds) or len(set(args.folds)) != len(args.folds)
         or (args.scale_epochs is not None and args.scale_epochs < 1)):
         p.error('Invalid hyperparameters or folds')
     run(args)
